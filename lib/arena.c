@@ -1,260 +1,186 @@
-#include "arena.h"
+/* arena.h -- Public interface of the arena allocator (no per-block headers).
+
+   Author:  contato.lucasdwbfff@gmail.com
+
+   This file is part of mclibc.
+
+   mclibc is a MINIMAL package of functions that ships bundled with
+   Carla, the programming language.  Everything in mclibc is written to
+   be tiny, dependency free (no libc, no malloc) and easy to audit.
+
+   The implementation lives in `arena.c'.  This header only declares
+   the types, the constants and the public functions.
+
+   ---------------------------------------------------------------------
+   CODE CONVENTIONS (READ THIS BEFORE WRITING ANY "stdlibcore" LIB)
+   ---------------------------------------------------------------------
+
+   The code in this file and in `arena.c' is the REFERENCE EXAMPLE for
+   every "lib" that belongs to Carla's "stdlibcore".  Its style is
+   intentionally uniform, so that all libs look and behave the same
+   way.  The rules that this header demonstrates are:
+
+   1. Namespacing.  Every identifier that the lib defines is spelled
+      through the `mangled (id)' macro.  For this lib,
+      `mangled (alloc)' expands to `arena_alloc'.  Changing the prefix
+      means changing ONE line.  Only the lib's own constants and
+      macros (such as ARENA_ALIGN) carry the prefix in plain text, in
+      upper case.
+
+   2. One header per lib, one source file per lib.  The header holds
+      types, constants and the public function table; the source file
+      holds every definition.
+
+   3. Public API through an X-macro.  The functions are listed ONCE, in
+      a `FUNCTIONS' table, and that single list is expanded to emit
+      the declarations.  Adding a public function means adding one line
+      to the table, so the declarations can never drift apart.
+
+   4. Data types are plain structs, passed to functions by pointer,
+      with no hidden global state.  The caller owns all the memory.
+
+   5. Comments follow the GNU style: full sentences, two spaces after a
+      period, and the closing marker of a multi-line comment on the
+      last line of text.
+
+   For the function layout and the platform rules, see `arena.c'.  */
+
 #include <stddef.h>
 
-#if defined(_WIN32)
-#define ARENA_OS_WINDOWS 1
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-#elif defined(__linux__)
-#define ARENA_OS_LINUX 1
-#include "syscall.h"
-#else
-#error "arena: os not supported"
-#endif
+/* ---------------------------------------------------------------------
+   Namespacing.
 
-#if defined(ARENA_OS_LINUX)
+   `mangled (id)' pastes the prefix `arena_' in front of ID, so that
+   the lib's names cannot clash with the ones of any other lib or of
+   the user's program.  It is used for types and for functions alike.  */
 
-#define PROT_READ     0x1
-#define PROT_WRITE    0x2
-#define MAP_PRIVATE   0x02
-#define MAP_ANONYMOUS 0x20
+#define mangled(id) arena_##id
 
-#if defined(__x86_64__)
+/* ---------------------------------------------------------------------
+   Basic types.  */
 
-static inline long
-mangled (mclibcsys6) (
-    long number,
-    long a1, long a2, long a3,
-    long a4, long a5, long a6
-) {
-    register long r10 __asm__("r10") = a4;
-    register long r8  __asm__("r8")  = a5;
-    register long r9  __asm__("r9")  = a6;
-    long result;
-    __asm__ volatile (
-        "syscall"
-        : "=a"(result)
-        : "a"(number),
-          "D"(a1),
-          "S"(a2),
-          "d"(a3),
-          "r"(r10),
-          "r"(r8),
-          "r"(r9)
-        : "rcx", "r11", "memory"
-    );
-    return result;
-}
+/* A single byte of memory.  Unsigned, so that pointer arithmetic on
+   `byte *' moves one byte at a time and never sign-extends.  */
+typedef unsigned char mangled(byte);
 
-static inline long
-mangled(sys_mmap) (size_t length)
-{   return mangled(mclibcsys6)(
-        9, 0, (long)length,
-        PROT_READ | PROT_WRITE,
-        MAP_PRIVATE | MAP_ANONYMOUS,
-        -1, 0
-    );
-}
+/* An opaque address handed to (or received from) the user.  It is a
+   `void *' so that it converts to any pointer type without a cast.  */
+typedef void* mangled(addr);
 
-static inline long
-mangled(sys_munmap) (mangled(addr) ptr, size_t length)
-{   return mangled(mclibcsys6)(11, (long)ptr, (long)length, 0, 0, 0, 0);
-}
+/* ---------------------------------------------------------------------
+   Node: describes a range of memory as "ADDR until ADDR + SIZE".
 
-#elif defined(__i386__)
+   There is no concept of chunk or block with a header.  A node is just
+   an address and a length, and the same structure describes both live
+   allocations and freed ranges.  Nodes are stored INSIDE the arena, at
+   its end, so no external allocator is needed to manage them.
 
-static inline long
-mangled (mclibcsys3) (long number, long a1, long a2, long a3)
-{   long result;
-    __asm__ volatile (
-        "pushl %%ebx\n\t"
-        "movl  %2, %%ebx\n\t"
-        "int   $0x80\n\t"
-        "popl  %%ebx"
-        : "=a"(result)
-        : "0"(number), "ri"(a1), "c"(a2), "d"(a3)
-        : "memory", "cc"
-    );
-    return result;
-}
+   The same node lives in exactly one of three lists (see `t' below).  */
 
-static inline long
-mangled(sys_mmap) (size_t length)
-{   struct {
-        unsigned long addr, len, prot, flags, fd, offset;
-    } args = {
-        0, (unsigned long)length,
-        PROT_READ | PROT_WRITE,
-        MAP_PRIVATE | MAP_ANONYMOUS,
-        (unsigned long)-1, 0
-    };
-    return mangled(mclibcsys3)(90, (long)&args, 0, 0);
-}
+typedef struct mangled(node) {
+    mangled(byte) *addr;            /* first byte of the range.          */
+    size_t size;                    /* length of the range, in bytes.    */
+    struct mangled(node) *next;     /* next node in the same list, or
+                                       NULL at the end of the list.      */
+} mangled(node);
 
-static inline long
-mangled(sys_munmap) (mangled(addr) ptr, size_t length)
-{   return mangled(mclibcsys3)(91, (long)ptr, (long)length, 0);
-}
+/* ---------------------------------------------------------------------
+   Arena: the state of one allocator.
 
-#else
-#error "arena: Arch Linux not supported"
-#endif
+   The arena is ONE contiguous region obtained from the operating
+   system.  Inside it, two areas grow towards each other:
 
-static inline mangled(addr)
-mangled(mmap) (mangled(addr) ptr, size_t length)
-{   (void)ptr;
-    long r = mangled(sys_mmap)(length);
-    if( ((unsigned long)r) > (unsigned long)-4096L ) return NULL;
-    return (mangled(addr)) r;
-}
+       low addresses                                    high addresses
+       +--------------------+-----------------+----------------------+
+       | user data  ->      |   (free room)   |      <-  node table  |
+       +--------------------+-----------------+----------------------+
+       ^ mem                ^ mem+offset        ^ mem+limit-meta       ^ mem+limit
 
-static inline int
-mangled(munmap) (mangled(addr) ptr, size_t length)
-{   return (int) mangled(sys_munmap)(ptr, length);
-}
+   The struct is small and is returned BY VALUE from `start'; every
+   other function receives a pointer to it.  A zero-filled struct is a
+   valid, empty arena that has no memory (every `alloc' on it fails).  */
 
-#elif defined(ARENA_OS_WINDOWS)
+typedef struct mangled(t) {
+    mangled(byte) *mem;         /* base of the region given by the OS.   */
+    size_t capacity;            /* size of that region, in bytes.        */
 
-static inline mangled(addr)
-mangled(mmap) (mangled(addr) ptr, size_t length)
-{   return VirtualAlloc(ptr, length, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-}
+    size_t offset;              /* top of the data area.  It grows
+                                   upwards; everything below it has been
+                                   handed out at least once.             */
+    size_t meta;                /* bytes used by the node table at the
+                                   end of the region.  It grows
+                                   downwards.                            */
 
-static inline int
-mangled(munmap) (mangled(addr) ptr, size_t length)
-{   (void)length;
-    return VirtualFree(ptr, 0, MEM_RELEASE) ? 0 : -1;
-}
+    mangled(node) *free_list;   /* ranges that were freed, sorted by
+                                   address and merged with their
+                                   neighbours when they touch.           */
+    mangled(node) *used_list;   /* live allocations.  Looked up by
+                                   address when the user frees one.      */
+    mangled(node) *spare;       /* dead nodes kept for reuse, so that the
+                                   node table is bounded by the PEAK
+                                   number of simultaneous allocations.   */
+} mangled(t);
 
-#endif
+/* ---------------------------------------------------------------------
+   Alignment.
 
-static inline size_t
-mangled(limit) (mangled(t) *a)
-{   return a->capacity & ~(size_t)(ARENA_ALIGN - 1);
-}
+   ARENA_ALIGN is the alignment, in bytes, of every pointer returned by
+   `alloc'.  It MUST be a power of two: the rounding below relies on it.
+   16 bytes satisfies the strictest scalar type on x86_64 (and SSE
+   vectors), and the base of the region is page aligned by the OS.  */
 
-static inline size_t
-mangled(room) (mangled(t) *a)
-{   return mangled(limit)(a) - a->offset - a->meta;
-}
+#define ARENA_ALIGN 16
 
-static inline mangled(node)*
-mangled(node_get) (mangled(t) *a)
-{   mangled(node) *n = a->spare;
-    if( n ) { a->spare = n->next; return n; }
-    if( mangled(room)(a) < sizeof(mangled(node)) ) return NULL;
-    a->meta += sizeof(mangled(node));
-    return (mangled(node)*)(a->mem + mangled(limit)(a) - a->meta);
-}
+/* Round the request N up to the size that is really reserved.
 
-static inline void
-mangled(node_put) (mangled(t) *a, mangled(node) *n)
-{   n->next = a->spare;
-    a->spare = n;
-}
+   Two things happen, in this order:
 
-inline mangled(t)
-mangled(start) (size_t bytes)
-{   mangled(t) arena = {0};
-    arena.mem = mangled(mmap) (NULL, bytes);
-    arena.capacity = arena.mem ? bytes : 0;
-    return arena;
-}
+     1. N is raised to at least sizeof (node).  This is a minimum
+        block size that fits a node.
 
-inline mangled(addr)
-mangled(alloc) (mangled(t) *a, size_t size)
-{   if( size == 0 || size > (size_t)-1 - ARENA_ALIGN ) return NULL;
-    size_t total = ARENA_NORM(size);
+     2. The result is rounded UP to the next multiple of ARENA_ALIGN,
+        with the usual trick `(x + A - 1) & ~(A - 1)', valid because A
+        is a power of two.
 
-    for( mangled(node) **link = &a->free_list; *link; link = &(*link)->next ) {
-        mangled(node) *n = *link;
-        if( n->size < total ) continue;
+   The macro evaluates N more than once, so N must not have side
+   effects.  */
 
-        if( n->size == total ) {
-            *link = n->next;
-            n->next = a->used_list;
-            a->used_list = n;
-            return n->addr;
-        }
+#define ARENA_NORM(n)                                               \
+    ( ( ((n) < sizeof(mangled(node)) ? sizeof(mangled(node)) : (n)) \
+        + ARENA_ALIGN - 1 ) & ~(size_t)(ARENA_ALIGN - 1) )
 
-        mangled(node) *r = mangled(node_get)(a);
-        if( !r ) return NULL;
-        r->addr = n->addr;
-        r->size = total;
-        r->next = a->used_list;
-        a->used_list = r;
+/* ---------------------------------------------------------------------
+   Public functions, listed as an X-macro.
 
-        n->addr += total;
-        n->size -= total;
-        return r->addr;
-    }
+   Each line is `X (name, return type, (parameters))'.  Expanding
+   `FUNCTIONS' with different definitions of `X' yields different
+   artifacts from the same single list.  Here it emits the declarations;
+   the contract of each function is documented in `arena.c', next to its
+   definition.
 
-    mangled(node) *r = mangled(node_get)(a);
-    if( !r ) return NULL;
-    if( total > mangled(room)(a) ) { mangled(node_put)(a, r); return NULL; }
+     start    Create an arena backed by BYTES bytes from the OS.
+     alloc    Allocate SIZE bytes; NULL if there is no room.
+     dump     Free the allocation that starts at PTR (the size is
+              found by the arena itself, from the address).
+     reset    Forget every allocation at once, keeping the memory.
+     destroy  Return the whole arena to the OS.  */
 
-    r->addr = a->mem + a->offset;
-    r->size = total;
-    r->next = a->used_list;
-    a->used_list = r;
-    a->offset += total;
-    return r->addr;
-}
+#define FUNCTIONS                                                   \
+X(start,   mangled(t),    (size_t bytes))                           \
+X(alloc,   mangled(addr), (mangled(t) *arena, size_t size))         \
+X(dump,    void,          (mangled(t) *arena, mangled(addr) ptr))   \
+X(reset,   void,          (mangled(t) *arena))                      \
+X(destroy, void,          (mangled(t) *arena))
 
-inline void
-mangled(dump) (mangled(t) *a, mangled(addr) p)
-{   if( !p ) return;
+/* Emit one `extern inline' declaration per entry of the table.
 
-    mangled(node) *r = NULL;
-    for( mangled(node) **l = &a->used_list; *l; l = &(*l)->next )
-    /* -> */ if( (*l)->addr == (mangled(byte)*)p ) {
-        r = *l;
-        *l = r->next;
-        break;
-    }
+   In C99 and later, an `inline' definition in `arena.c' together with
+   an `extern inline' declaration visible in that same file makes the
+   compiler emit ONE external definition of each function.  Other
+   translation units can inline the calls or link against that
+   definition, with no duplicated symbols.  */
 
-    if( !r ) return;
-
-    mangled(node) *prev = NULL, *next = a->free_list;
-    while( next && next->addr < r->addr ) { prev = next; next = next->next; }
-    r->next = next;
-
-    if( next && r->addr + r->size == next->addr ) {
-        r->size += next->size;
-        r->next  = next->next;
-        mangled(node_put)(a, next);
-    }
-
-    if( prev && prev->addr + prev->size == r->addr ) {
-        prev->size += r->size;
-        prev->next  = r->next;
-        mangled(node_put)(a, r);
-        r = prev;
-    } else if( prev ) prev->next = r;
-    else a->free_list = r;
-
-    if( r->addr + r->size == a->mem + a->offset ) {
-        a->offset = r->addr - a->mem;
-        mangled(node) **l = &a->free_list;
-        while(*l != r) l = &(*l)->next;
-        *l = NULL;
-        mangled(node_put)(a, r);
-    }
-}
-
-inline void
-mangled(reset) (mangled(t) *a)
-{   a->offset = 0;
-    a->meta = 0;
-    a->free_list = a->used_list = a->spare = NULL;
-}
-
-inline void
-mangled(destroy) (mangled(t) *a)
-{   if( a->mem ) mangled(munmap)(a->mem, a->capacity);
-    a->mem = NULL;
-    a->capacity = a->offset = a->meta = 0;
-    a->free_list = a->used_list = a->spare = NULL;
-}
+#define X(id, ret, args)                                            \
+extern inline ret mangled(id) args;
+FUNCTIONS
+#undef X
