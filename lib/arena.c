@@ -58,6 +58,31 @@ mangled(munmap) (mangled(addr) ptr, size_t length)
     );
 }
 
+static inline size_t
+mangled(limit) (mangled(t) *a)
+{   return a->capacity & ~(size_t)(ARENA_ALIGN - 1);
+}
+
+static inline size_t
+mangled(room) (mangled(t) *a)
+{   return mangled(limit)(a) - a->offset - a->meta;
+}
+
+static inline mangled(node)*
+mangled(node_get) (mangled(t) *a)
+{   mangled(node) *n = a->spare;
+    if( n ) { a->spare = n->next; return n; }
+    if( mangled(room)(a) < sizeof(mangled(node)) ) return NULL;
+    a->meta += sizeof(mangled(node));
+    return (mangled(node)*)(a->mem + mangled(limit)(a) - a->meta);
+}
+
+static inline void
+mangled(node_put) (mangled(t) *a, mangled(node) *n)
+{   n->next = a->spare;
+    a->spare = n;
+}
+
 inline mangled(t)
 mangled(start) (size_t bytes)
 {   mangled(t) arena = {0};
@@ -67,80 +92,97 @@ mangled(start) (size_t bytes)
 }
 
 inline mangled(addr)
-mangled(alloc) (mangled(t) *arena, size_t size)
-{   size = ARENA_NORM(size);
-    mangled(node) **link = &arena->free_list;
-    while(*link) {
+mangled(alloc) (mangled(t) *a, size_t size)
+{   if( size == 0 || size > (size_t)-1 - ARENA_ALIGN ) return NULL;
+    size_t total = ARENA_NORM(size);
+
+    for( mangled(node) **link = &a->free_list; *link; link = &(*link)->next ) {
         mangled(node) *n = *link;
-        if( n->size >= size ) {
-            size_t rest = n->size - size;
-            if( rest <= 0 ) *link = n->next;
-            else {
-                mangled(node) *r = (mangled(node)*)((mangled(byte)*)n + size);
-                r->size = rest;
-                r->next = n->next;
-                *link = r;
-            }
+        if( n->size < total ) continue;
 
-            return (mangled(addr))n;
+        if( n->size == total ) {
+            *link = n->next;
+            n->next = a->used_list;
+            a->used_list = n;
+            return n->addr;
         }
-        link = &n->next;
+
+        mangled(node) *r = mangled(node_get)(a);
+        if( !r ) return NULL;
+        r->addr = n->addr;
+        r->size = total;
+        r->next = a->used_list;
+        a->used_list = r;
+
+        n->addr += total;
+        n->size -= total;
+        return r->addr;
     }
 
-    if( arena->offset + size > arena->capacity ) return NULL;
-    mangled(byte) *ptr = arena->mem + arena->offset;
-    arena->offset += size;
-    return ptr;
+    mangled(node) *r = mangled(node_get)(a);
+    if( !r ) return NULL;
+    if( total > mangled(room)(a) ) { mangled(node_put)(a, r); return NULL; }
+
+    r->addr = a->mem + a->offset;
+    r->size = total;
+    r->next = a->used_list;
+    a->used_list = r;
+    a->offset += total;
+    return r->addr;
 }
 
 inline void
-mangled(dump) (mangled(t) *arena, mangled(addr) p, size_t size)
+mangled(dump) (mangled(t) *a, mangled(addr) p)
 {   if( !p ) return;
-    mangled(byte) *ptr = p;
-    size = ARENA_NORM(size);
 
-    mangled(node) *prev = NULL, *next = arena->free_list;
-    while(next && (mangled(byte)*)next < ptr) {
-        prev = next;
-        next = next->next;
+    mangled(node) *r = NULL;
+    for( mangled(node) **l = &a->used_list; *l; l = &(*l)->next )
+    /* -> */ if( (*l)->addr == (mangled(byte)*)p ) {
+        r = *l;
+        *l = r->next;
+        break;
     }
 
-    mangled(node) *n = (mangled(node)*)ptr;
-    n->size = size;
-    n->next = next;
+    if( !r ) return;
 
-    if( next && ptr + size == (mangled(byte)*)next ) {
-        n->size += next->size;
-        n->next  = next->next;
+    mangled(node) *prev = NULL, *next = a->free_list;
+    while( next && next->addr < r->addr ) { prev = next; next = next->next; }
+    r->next = next;
+
+    if( next && r->addr + r->size == next->addr ) {
+        r->size += next->size;
+        r->next  = next->next;
+        mangled(node_put)(a, next);
     }
 
-    if( prev && ((mangled(byte)*)prev) + prev->size == ptr ) {
-        prev->size += n->size;
-        prev->next  = n->next;
-        n = prev;
-    } else if( prev ) prev->next = n;
-    else arena->free_list = n;
+    if( prev && prev->addr + prev->size == r->addr ) {
+        prev->size += r->size;
+        prev->next  = r->next;
+        mangled(node_put)(a, r);
+        r = prev;
+    } else if( prev ) prev->next = r;
+    else a->free_list = r;
 
-    if( ((mangled(byte)*)n) + n->size == arena->mem + arena->offset ) {
-        arena->offset = (mangled(byte)*)n - arena->mem;
-        mangled(node) **l = &arena->free_list;
-        while( *l != n ) l = &(*l)->next;
+    if( r->addr + r->size == a->mem + a->offset ) {
+        a->offset = r->addr - a->mem;
+        mangled(node) **l = &a->free_list;
+        while(*l != r) l = &(*l)->next;
         *l = NULL;
+        mangled(node_put)(a, r);
     }
 }
 
 inline void
-mangled(reset) (mangled(t) *arena)
-{   arena->offset = 0;
-    arena->free_list = NULL;
+mangled(reset) (mangled(t) *a)
+{   a->offset = 0;
+    a->meta = 0;
+    a->free_list = a->used_list = a->spare = NULL;
 }
 
-
 inline void
-mangled(destroy) (mangled(t) *arena)
-{   if( arena->mem ) mangled(munmap)(arena->mem, arena->capacity);
-    arena->mem = NULL;
-    arena->free_list = NULL;
-    arena->capacity = 0;
-    arena->offset = 0;
+mangled(destroy) (mangled(t) *a)
+{   if( a->mem ) mangled(munmap)(a->mem, a->capacity);
+    a->mem = NULL;
+    a->capacity = a->offset = a->meta = 0;
+    a->free_list = a->used_list = a->spare = NULL;
 }
