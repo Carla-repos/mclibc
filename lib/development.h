@@ -1,9 +1,11 @@
 #ifndef DEVELOPMENT_H
 #define DEVELOPMENT_H
 
+#include <stdint.h>
+
 #define mangled(id) development_##id
 
-void mangled(fill) (char *input, char *bytes);
+void mangled(fill) (char *bytes, int32_t size);
 void mangled(debug) (char *str);
 
 
