@@ -322,7 +322,7 @@ mangled(mmap) (mangled(addr) ptr, size_t length)
    zero and always frees the whole region that was reserved.  */
 static inline int
 mangled(munmap) (mangled(addr) ptr, size_t length)
-{   (void)length;   /* MEM_RELEASE exige tamanho 0 */
+{   (void)length;
     return VirtualFree(ptr, 0, MEM_RELEASE) ? 0 : -1;
 }
 
