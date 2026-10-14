@@ -3,7 +3,7 @@
 
 void
 mangled(fill) (char *bytes, int32_t size)
-{   char *input = "This text isn't in the mclibc test file (development.c), so I need to type a bunch of planned things - like \"I love Samar\" - so we can test the byte allocation.\n";
+{   char *input = "This text isn't in the mclibc test file (development.c), so I need to type a bunch of planned things - like \"I love Samar\" - so we can test the byte allocation.\n\n\n";
     int32_t i = 0;
     while( i < size && input[i] != '\0' )
         bytes[i] = input[i], i++;
