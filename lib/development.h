@@ -5,7 +5,7 @@
 
 #define mangled(id) development_##id
 
-void mangled(fill) (char *bytes, int32_t size);
+void mangled(fill) (char *bytes, int32_t start, int32_t size);
 void mangled(debug) (char *str);
 void mangled(exit) (int code);
 
