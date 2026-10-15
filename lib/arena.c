@@ -71,9 +71,10 @@
      `meta' is its size in bytes.
 
    Every allocation is described by a NODE, which stores an address and
-   a size ("9 until 103", for instance).  Nodes live inside the arena
-   itself, so no external allocator is needed.  Nodes are kept in three
-   singly linked lists:
+   a size ("9 until 103", for instance), and by a REF, the small handle
+   that `alloc' returns to the user (see `arena.h').  Both live inside
+   the arena itself, in the node table, so no external allocator is
+   needed.  Nodes are kept in three singly linked lists:
 
    * `used_list'  - live allocations.  Freeing looks up the pointer
                     here; the address found IS the identity, and the
@@ -81,12 +82,21 @@
                     header is stored before the user's data.
    * `free_list'  - ranges that were freed, sorted by address, and
                     merged with their neighbours whenever they touch.
-   * `spare'      - dead nodes, kept for reuse so that the node table
-                    is bounded by the PEAK number of simultaneous
+   * `spare'      - dead nodes, kept for reuse so that the number of
+                    nodes is bounded by the PEAK number of simultaneous
                     allocations rather than by the total history.
 
+   Refs are different: a ref must keep telling "this address was
+   freed" AFTER the free, so it can never be recycled.  Each `alloc'
+   therefore consumes one ref from the node table until `reset' or
+   `destroy'.
+
    Freed ranges have no "chunk" concept: a range is just an address
-   and a length, and may be split or merged freely.  */
+   and a length, and may be split or merged freely.
+
+   Every byte handed out by `alloc' is zero-filled, no matter whether
+   it comes from fresh pages, from a reused free range, or from a data
+   area that `dump' gave back.  */
 
 #include "arena.h"
 #include <stddef.h>
@@ -335,7 +345,9 @@ mangled(munmap) (mangled(addr) ptr, size_t length)
 
 /* Return the usable size of the arena, rounded DOWN to a multiple of
    ARENA_ALIGN.  The node table is anchored at this boundary, which
-   keeps every node naturally aligned.  */
+   keeps every entry of the table naturally aligned: nodes and refs
+   have sizes that are multiples of 8, and the boundary is a multiple
+   of ARENA_ALIGN.  */
 static inline size_t
 mangled(limit) (mangled(t) *a)
 {   return a->capacity & ~(size_t)(ARENA_ALIGN - 1);
@@ -343,25 +355,49 @@ mangled(limit) (mangled(t) *a)
 
 /* Return how many bytes are still untouched between the top of the
    data area and the bottom of the node table.  This is the room
-   available for BOTH new data and new nodes.  */
+   available for new data AND for new table entries.  */
 static inline size_t
 mangled(room) (mangled(t) *a)
 {   return mangled(limit)(a) - a->offset - a->meta;
 }
 
+/* Fill the N bytes starting at P with zeros.
+
+   The stores go through a `volatile' pointer on purpose: otherwise the
+   compiler may turn this loop into a call to `memset', which does not
+   exist here because there is no libc.  */
+static inline void
+mangled(zero) (mangled(byte) *p, size_t n)
+{   volatile mangled(byte) *v = p;
+    while( n-- ) *v++ = 0;
+}
+
+/* Grow the node table downwards by SIZE bytes and return the new
+   entry.  The caller MUST have checked `room' before; nothing is
+   verified here.  */
+static inline mangled(addr)
+mangled(table_get) (mangled(t) *a, size_t size)
+{   a->meta += size;
+    return a->mem + mangled(limit)(a) - a->meta;
+}
+
 /* Obtain a node to describe an allocation or a free range.
 
    A recycled node from the `spare' list is preferred.  Only when none
-   is available does the node table grow downwards by one node.
-
-   Returns NULL if there is not enough room left for another node.  */
+   is available does the node table grow.  The caller MUST have checked
+   that there is room for `node_cost' bytes.  */
 static inline mangled(node)*
 mangled(node_get) (mangled(t) *a)
 {   mangled(node) *n = a->spare;
     if( n ) { a->spare = n->next; return n; }
-    if( mangled(room)(a) < sizeof(mangled(node)) ) return NULL;
-    a->meta += sizeof(mangled(node));
-    return (mangled(node)*)(a->mem + mangled(limit)(a) - a->meta);
+    return (mangled(node)*) mangled(table_get)(a, sizeof(mangled(node)));
+}
+
+/* Return how many bytes of the node table `node_get' will consume
+   right now: zero when a spare node is available.  */
+static inline size_t
+mangled(node_cost) (mangled(t) *a)
+{   return a->spare ? 0 : sizeof(mangled(node));
 }
 
 /* Give a node that is no longer needed back to the `spare' list, so
@@ -394,68 +430,91 @@ mangled(start) (size_t bytes)
     return arena;
 }
 
-/* Allocate SIZE bytes from the arena A.
+/* Allocate SIZE bytes from the arena A, all of them set to zero.
 
    The size is rounded up to a multiple of ARENA_ALIGN, so every
-   returned pointer is ARENA_ALIGN-byte aligned.  The strategy is:
+   returned address is ARENA_ALIGN-byte aligned.  The strategy is:
 
      1. First fit over the free list.  A range that is a perfect fit is
         promoted to a live allocation as is.  A larger range is split:
         the front becomes the allocation and the free range shrinks.
      2. Otherwise, the top of the data area is advanced.
 
+   The result is a pointer to a REF: the handle that stores the address
+   and the `freed' flag.  Use `makeraw' to get the plain address.
+
    Returns NULL if SIZE is zero, if it is absurdly large, or if the
-   arena has no room left for the data plus its bookkeeping node.  */
-inline mangled(addr)
+   arena has no room left for the data plus its bookkeeping (a node,
+   unless a spare one exists, and the ref).  Nothing is modified when
+   NULL is returned.  */
+inline mangled(ref)*
 mangled(alloc) (mangled(t) *a, size_t size)
 {   /* Reject zero, and sizes that would overflow when rounded up.  */
     if( size == 0 || size > (size_t)-1 - ARENA_ALIGN ) return NULL;
     size_t total = ARENA_NORM(size);
+    size_t room = mangled(room)(a);
+    size_t refs = sizeof(mangled(ref));
 
     /* Step 1: look for a suitable free range (first fit).  `link'
        points at the pointer that references the current node, which
        lets us unlink a node without keeping a `prev' pointer.  */
-    for( mangled(node) **link = &a->free_list; *link; link = &(*link)->next ) {
-        mangled(node) *n = *link;
-        if( n->size < total ) continue;     /* too small, keep looking  */
+    mangled(node) **link = &a->free_list;
+    while( *link && (*link)->size < total ) link = &(*link)->next;
+    mangled(node) *n = *link;
 
+    /* All the room checks happen BEFORE anything is touched, so a
+       failure leaves the arena exactly as it was.  */
+    mangled(node) *r;
+    mangled(ref) *h;
+    if( n && n->size == total ) {
         /* Perfect fit: the free node itself becomes the allocation
            node, so no new node is needed.  */
-        if( n->size == total ) {
-            *link = n->next;                /* unlink from free list    */
-            n->next = a->used_list;         /* push on used list        */
-            a->used_list = n;
-            return n->addr;
-        }
-
+        if( room < refs ) return NULL;
+        h = (mangled(ref)*) mangled(table_get)(a, refs);
+        *link = n->next;                    /* unlink from free list    */
+        r = n;
+    } else if( n ) {
         /* The range is larger than needed: carve the allocation out
-           of its front.  A fresh node describes the allocation...  */
-        mangled(node) *r = mangled(node_get)(a);
-        if( !r ) return NULL;
+           of its front.  A fresh node describes the allocation, and
+           the free range just loses the bytes we took.  */
+        if( room < mangled(node_cost)(a) + refs ) return NULL;
+        r = mangled(node_get)(a);
+        h = (mangled(ref)*) mangled(table_get)(a, refs);
         r->addr = n->addr;
-        r->size = total;
-        r->next = a->used_list;
-        a->used_list = r;
-
-        /* ...and the free range just loses the bytes we took.  */
         n->addr += total;
         n->size -= total;
-        return r->addr;
+    } else {
+        /* Step 2: no free range fits, so grow the data area.  */
+        if( room < total || room - total < mangled(node_cost)(a) + refs )
+            return NULL;
+        r = mangled(node_get)(a);
+        h = (mangled(ref)*) mangled(table_get)(a, refs);
+        r->addr = a->mem + a->offset;
+        a->offset += total;
     }
 
-    /* Step 2: no free range fits, so grow the data area.  We need a
-       node first; it is returned to the spare list if the data then
-       turns out not to fit.  */
-    mangled(node) *r = mangled(node_get)(a);
-    if( !r ) return NULL;
-    if( total > mangled(room)(a) ) { mangled(node_put)(a, r); return NULL; }
-
-    r->addr = a->mem + a->offset;
+    /* Common tail: describe the allocation, zero it (memory coming
+       from a free range or from a lowered `offset' is dirty) and
+       publish it on the used list.  */
     r->size = total;
+    mangled(zero)(r->addr, total);
+    h->freed = 0;
+    h->ptr = r->addr;
+    r->ref = h;
     r->next = a->used_list;
     a->used_list = r;
-    a->offset += total;
-    return r->addr;
+    return h;
+}
+
+/* Return the plain address stored in the handle H.
+
+   Returns NULL if H is NULL or if the allocation has already been
+   freed, so a stale handle can never be used by mistake (and
+   `dump (a, makeraw (h))' on it is a harmless no-op).  */
+inline mangled(addr)
+mangled(makeraw) (mangled(ref) *h)
+{   if( !h || h->freed ) return NULL;
+    return h->ptr;
 }
 
 /* Free the allocation that starts at P.
@@ -465,11 +524,12 @@ mangled(alloc) (mangled(t) *a, size_t size)
    of the allocation.  A pointer that is not found (a bogus pointer or
    a double free) is silently ignored, leaving the arena untouched.
 
-   The freed range is then inserted in the free list, keeping it sorted
-   by address, and merged with the previous and next ranges whenever
-   they are adjacent in memory.  Finally, if the resulting range touches
-   the top of the data area, it is handed back to the untouched region
-   by lowering `offset'.  */
+   The handle of the allocation is marked as freed.  The freed range is
+   then inserted in the free list, keeping it sorted by address, and
+   merged with the previous and next ranges whenever they are adjacent
+   in memory.  Finally, if the resulting range touches the top of the
+   data area, it is handed back to the untouched region by lowering
+   `offset'.  */
 inline void
 mangled(dump) (mangled(t) *a, mangled(addr) p)
 {   if( !p ) return;
@@ -485,6 +545,10 @@ mangled(dump) (mangled(t) *a, mangled(addr) p)
     }
 
     if( !r ) return;    /* not ours, or already freed: nothing to do    */
+
+    /* The handle outlives the node, so it is marked here, before the
+       node is merged or recycled.  */
+    r->ref->freed = 1;
 
     /* Find the insertion point in the address-sorted free list.  When
        the loop ends, PREV is the last range before R (or NULL) and NEXT
@@ -516,7 +580,8 @@ mangled(dump) (mangled(t) *a, mangled(addr) p)
        above it that is still in use, so give it back to the untouched
        region by lowering the top.  Being the highest range, it is
        necessarily the LAST node of the free list, so it is unlinked
-       from there and recycled.  */
+       from there and recycled.  The bytes it held are dirty, which is
+       fine: `alloc' zeroes everything it hands out.  */
     if( r->addr + r->size == a->mem + a->offset ) {
         a->offset = r->addr - a->mem;
         mangled(node) **l = &a->free_list;
@@ -529,9 +594,10 @@ mangled(dump) (mangled(t) *a, mangled(addr) p)
 /* Forget every allocation at once, keeping the underlying memory.
 
    The arena goes back to its just-started state: the data area and the
-   node table are empty, and all three lists are dropped.  Every pointer
-   previously returned by `alloc' becomes invalid.  This is the classic
-   arena "free everything" operation, and it runs in constant time.  */
+   node table are empty, and all three lists are dropped.  Every
+   pointer and every handle previously returned by `alloc' becomes
+   invalid.  This is the classic arena "free everything" operation, and
+   it runs in constant time.  */
 inline void
 mangled(reset) (mangled(t) *a)
 {   a->offset = 0;
@@ -543,7 +609,8 @@ mangled(reset) (mangled(t) *a)
 
    After this call, A is left in a safe, empty state (`capacity' is
    zero and `mem' is NULL), so a repeated `destroy' or a later `alloc'
-   is harmless, and any pointer obtained from the arena is invalid.  */
+   is harmless, and any pointer or handle obtained from the arena is
+   invalid.  */
 inline void
 mangled(destroy) (mangled(t) *a)
 {   if( a->mem ) mangled(munmap)(a->mem, a->capacity);

@@ -68,6 +68,22 @@ typedef unsigned char mangled(byte);
 typedef void* mangled(addr);
 
 /* ---------------------------------------------------------------------
+   Ref: the handle returned by `alloc'.
+
+   It holds the address of the allocation and one byte that tells
+   whether that address has already been freed.  The handle is stored
+   inside the arena and, unlike a node, it is NEVER recycled while the
+   arena lives (only `reset' and `destroy' invalidate it).  This is
+   what lets `freed' keep answering correctly after `dump'.
+
+   Use `makeraw' to obtain the plain address from a handle.  */
+
+typedef struct mangled(ref) {
+    mangled(byte) freed;            /* 0 while live, 1 once freed.       */
+    mangled(addr) ptr;              /* first byte of the allocation.     */
+} mangled(ref);
+
+/* ---------------------------------------------------------------------
    Node: describes a range of memory as "ADDR until ADDR + SIZE".
 
    There is no concept of chunk or block with a header.  A node is just
@@ -82,6 +98,8 @@ typedef struct mangled(node) {
     size_t size;                    /* length of the range, in bytes.    */
     struct mangled(node) *next;     /* next node in the same list, or
                                        NULL at the end of the list.      */
+    mangled(ref) *ref;              /* handle of a live allocation; not
+                                       used by free ranges.              */
 } mangled(node);
 
 /* ---------------------------------------------------------------------
@@ -96,9 +114,10 @@ typedef struct mangled(node) {
        +--------------------+-----------------+----------------------+
        ^ mem                ^ mem+offset        ^ mem+limit-meta       ^ mem+limit
 
-   The struct is small and is returned BY VALUE from `start'; every
-   other function receives a pointer to it.  A zero-filled struct is a
-   valid, empty arena that has no memory (every `alloc' on it fails).  */
+   The node table holds both nodes and refs.  The struct is small and
+   is returned BY VALUE from `start'; every other function receives a
+   pointer to it.  A zero-filled struct is a valid, empty arena that
+   has no memory (every `alloc' on it fails).  */
 
 typedef struct mangled(t) {
     mangled(byte) *mem;         /* base of the region given by the OS.   */
@@ -117,7 +136,7 @@ typedef struct mangled(t) {
     mangled(node) *used_list;   /* live allocations.  Looked up by
                                    address when the user frees one.      */
     mangled(node) *spare;       /* dead nodes kept for reuse, so that the
-                                   node table is bounded by the PEAK
+                                   number of nodes is bounded by the PEAK
                                    number of simultaneous allocations.   */
 } mangled(t);
 
@@ -159,7 +178,10 @@ typedef struct mangled(t) {
    definition.
 
      start    Create an arena backed by BYTES bytes from the OS.
-     alloc    Allocate SIZE bytes; NULL if there is no room.
+     alloc    Allocate SIZE zero-filled bytes; returns a handle, or
+              NULL if there is no room.
+     makeraw  Return the plain address stored in a handle (NULL if the
+              handle is NULL or already freed).
      dump     Free the allocation that starts at PTR (the size is
               found by the arena itself, from the address).
      reset    Forget every allocation at once, keeping the memory.
@@ -167,7 +189,8 @@ typedef struct mangled(t) {
 
 #define FUNCTIONS                                                   \
 X(start,   mangled(t),    (size_t bytes))                           \
-X(alloc,   mangled(addr), (mangled(t) *arena, size_t size))         \
+X(alloc,   mangled(ref)*, (mangled(t) *arena, size_t size))         \
+X(makeraw, mangled(addr), (mangled(ref) *handle))                   \
 X(dump,    void,          (mangled(t) *arena, mangled(addr) ptr))   \
 X(reset,   void,          (mangled(t) *arena))                      \
 X(destroy, void,          (mangled(t) *arena))
