@@ -10,15 +10,15 @@ mangled(fill) (char *bytes, int32_t size)
 }
 
 void
-mangled(exit) (int code)
-{   asm volatile(
-        "mov $60, %%rax\n"
-        "mov %0, %%rdi\n"
-        "syscall\n"
+mangled(exit)(int code)
+{
+    asm volatile(
+        "syscall"
         :
-        : "r"(code)
-        : "rax", "rdi", "rsi", "rdx", "rcx", "r11", "memory"
+        : "a"(60L), "D"((long) code)
+        : "rcx", "r11", "memory"
     );
+    __builtin_unreachable();
 }
 
 void
