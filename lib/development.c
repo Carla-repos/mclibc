@@ -8,8 +8,9 @@
 #include "arena_ref.h"
 
 void
-mangled(fill) (ref *r, int32_t start, int32_t size)
-{   if( r->freed ) runtime_error(LIB)("Address already freed. You can't to fill it.");
+mangled(fill) (void *re, int32_t start, int32_t size)
+{   ref *r = (ref*)re;
+    if( r->freed ) runtime_error(LIB)("Address already freed. You can't to fill it.");
     char *input = "Hello, world!\nLorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.\n";
     int32_t i = 0;
     while( i < size && input[i] != '\0' ) ((char*)r->addr)[i] = input[i + start], i++;
@@ -28,8 +29,9 @@ mangled(exit)(int code)
 }
 
 void
-mangled(debug) (ref *r)
-{   if( r->freed ) runtime_error(LIB)("Address already freed. You can't to print it.");
+mangled(debug) (void *re)
+{   ref *r = (ref*)re;
+    if( r->freed ) runtime_error(LIB)("Address already freed. You can't to print it.");
     unsigned long len = 0;
     char *str = (char*)r->addr;
     while(str[len] != '\0') len++;
@@ -45,3 +47,5 @@ mangled(debug) (ref *r)
         : "rax", "rdi", "rsi", "rdx", "rcx", "r11", "memory"
     );
 }
+
+#undef mangled

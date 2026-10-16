@@ -1,5 +1,9 @@
 #include "arena.h"
-#include <string.h>
+#include "development.h"
+
+#define mangled_a(id) arena_##id
+#define mangled_d(id) development_##id
+
 #include <stdio.h>
 
 static void arena_debug(arena_t *a) {
@@ -12,33 +16,12 @@ static void arena_debug(arena_t *a) {
 }
 
 int main(void) {
-    mangled(t) arena = mangled(start)(1024);
+    mangled_a(t) arena = mangled_a(start)(1024);
     const char msg[] = "I love", second[] = "Samar";
 
-    mangled(byte) *ptr  = mangled(alloc)(&arena, 32);
-    mangled(byte) *what = mangled(alloc)(&arena, 16);
-
-    memcpy(ptr, msg, sizeof msg);
-    memcpy(what, second, sizeof second);
-
-    printf("base    = %p\n", (void*)arena.mem);
-    printf("ptr     = %p (offset %td)\n", (void*)ptr,  ptr  - arena.mem);
-    printf("what    = %p (offset %td)\n", (void*)what, what - arena.mem);
-    printf("content = %s %s\n", ptr, what);
-    printf("offset of arena = %zu\n", arena.offset);
-
-    arena_dump(&arena, ptr);
-    mangled(byte) *check = mangled(alloc)(&arena, 12);
-    memcpy(check, second, sizeof second);
-    printf("\nbase    = %p\n", (void*)arena.mem);
-    printf("ptr     = %p (offset %td)\n", (void*)ptr,  ptr  - arena.mem);
-    printf("check   = %p (offset %td)\n", (void*)check,  check  - arena.mem);
-    printf("what    = %p (offset %td)\n", (void*)what, what - arena.mem);
-    printf("content = %s %s\n", check, what);
-
-    arena_dump(&arena, check);
-    arena_dump(&arena, what);
-    arena_destroy(&arena);
+    mangled_a(ref) *mem = mangled_a(alloc)(&arena, 32);
+    sprintf(mem->ptr, "%s %s\n", msg, second);
+    mangled_d(debug)(mem);
 
     return 0;
 }

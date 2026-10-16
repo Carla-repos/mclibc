@@ -182,17 +182,18 @@ typedef struct mangled(t) {
               NULL if there is no room.
      makeraw  Return the plain address stored in a handle (NULL if the
               handle is NULL or already freed).
-     dump     Free the allocation that starts at PTR (the size is
-              found by the arena itself, from the address).
+     dump     Free the allocation described by HANDLE (the size is
+              found by the arena itself, from the address) and mark
+              the handle as freed.
      reset    Forget every allocation at once, keeping the memory.
      destroy  Return the whole arena to the OS.  */
 
-#define FUNCTIONS                                                   \
-X(start,   mangled(t),    (size_t bytes))                           \
-X(alloc,   mangled(ref)*, (mangled(t) *arena, size_t size))         \
-X(makeraw, mangled(addr), (mangled(ref) *handle))                   \
-X(dump,    void,          (mangled(t) *arena, mangled(addr) ptr))   \
-X(reset,   void,          (mangled(t) *arena))                      \
+#define FUNCTIONS                                                    \
+X(start,   mangled(t),    (size_t bytes))                            \
+X(alloc,   mangled(ref)*, (mangled(t) *arena, size_t size))          \
+X(makeraw, mangled(addr), (mangled(ref) *handle))                    \
+X(dump,    void,          (mangled(t) *arena, mangled(ref) *handle)) \
+X(reset,   void,          (mangled(t) *arena))                       \
 X(destroy, void,          (mangled(t) *arena))
 
 /* Emit one `extern inline' declaration per entry of the table.

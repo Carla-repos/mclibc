@@ -509,46 +509,45 @@ mangled(alloc) (mangled(t) *a, size_t size)
 /* Return the plain address stored in the handle H.
 
    Returns NULL if H is NULL or if the allocation has already been
-   freed, so a stale handle can never be used by mistake (and
-   `dump (a, makeraw (h))' on it is a harmless no-op).  */
+   freed, so a stale handle can never be used by mistake.  */
 inline mangled(addr)
 mangled(makeraw) (mangled(ref) *h)
 {   if( !h || h->freed ) return NULL;
     return h->ptr;
 }
 
-/* Free the allocation that starts at P.
+/* Free the allocation described by the handle H.
 
-   The allocation is looked up in the used list by ADDRESS: if a node
-   has the same address as P, the size stored in that node is the size
-   of the allocation.  A pointer that is not found (a bogus pointer or
-   a double free) is silently ignored, leaving the arena untouched.
+   The allocation is looked up in the used list by ADDRESS: the node
+   whose address equals `H->ptr' (and whose handle is H) holds the size
+   of the allocation.  A NULL handle, or a handle that is already
+   marked as freed (a double free), is silently ignored, leaving the
+   arena untouched.  So is a handle that does not belong to this arena.
 
-   The handle of the allocation is marked as freed.  The freed range is
-   then inserted in the free list, keeping it sorted by address, and
-   merged with the previous and next ranges whenever they are adjacent
-   in memory.  Finally, if the resulting range touches the top of the
-   data area, it is handed back to the untouched region by lowering
-   `offset'.  */
+   The handle is marked as freed.  The freed range is then inserted in
+   the free list, keeping it sorted by address, and merged with the
+   previous and next ranges whenever they are adjacent in memory.
+   Finally, if the resulting range touches the top of the data area, it
+   is handed back to the untouched region by lowering `offset'.  */
 inline void
-mangled(dump) (mangled(t) *a, mangled(addr) p)
-{   if( !p ) return;
+mangled(dump) (mangled(t) *a, mangled(ref) *h)
+{   if( !h || h->freed ) return;
 
-    /* Find the node whose address equals P and detach it from the used
-       list.  R stays NULL if there is no such node.  */
+    /* Find the node of this handle and detach it from the used list.
+       R stays NULL if there is no such node.  */
     mangled(node) *r = NULL;
     for( mangled(node) **l = &a->used_list; *l; l = &(*l)->next )
-    /* -> */ if( (*l)->addr == (mangled(byte)*)p ) {
+    /* -> */ if( (*l)->ref == h && (*l)->addr == (mangled(byte)*)h->ptr ) {
         r = *l;
         *l = r->next;
         break;
     }
 
-    if( !r ) return;    /* not ours, or already freed: nothing to do    */
+    if( !r ) return;    /* not ours: nothing to do                      */
 
     /* The handle outlives the node, so it is marked here, before the
        node is merged or recycled.  */
-    r->ref->freed = 1;
+    h->freed = 1;
 
     /* Find the insertion point in the address-sorted free list.  When
        the loop ends, PREV is the last range before R (or NULL) and NEXT
