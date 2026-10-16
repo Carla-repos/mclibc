@@ -11,9 +11,9 @@ extern "C" {
 #define mangled_d(id) development_##id
 
 int main() {
-    auto nashj = mangled_n(start)(1024);
-    auto first = mangled_n(alloc)(&nashj, 64);
-    auto mem = mangled_n(alloc)(&nashj, 32);
+    auto nashj = mangled_n(start)(32);
+    auto first = mangled_n(alloc)(&nashj, 16);
+    auto mem = mangled_n(alloc)(&nashj, 16);
     const char msg[] = "I love", second[] = "Samar";
     std::sprintf(static_cast<char*>(mem->ptr), "%s %s\n", msg, second);
     mangled_n(dump)(&nashj, first);

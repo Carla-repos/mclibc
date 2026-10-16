@@ -67,25 +67,30 @@
    DESIGN OVERVIEW
    ---------------------------------------------------------------------
 
-   The nashj is ONE contiguous region obtained from the operating
-   system.  Inside that region, the memory is split in two areas that
-   grow towards each other:
+   The nashj owns TWO kinds of memory:
+
+   * The DATA REGION: one contiguous region obtained from the operating
+     system, with exactly the size that was asked from `start'.  It
+     holds user data and nothing else, so a nashj started with 128
+     bytes can hand out 128 bytes of data:
 
        low addresses                                    high addresses
-       +--------------------+-----------------+----------------------+
-       | user data  ->      |   (free room)   |      <-  node table  |
-       +--------------------+-----------------+----------------------+
-       ^ mem                ^ mem+offset        ^ mem+limit-meta       ^ mem+limit
+       +--------------------------+---------------------------------+
+       | user data  ->            |           (free room)           |
+       +--------------------------+---------------------------------+
+       ^ mem                      ^ mem+offset                      ^ mem+capacity
 
-   * The data area grows upwards, from `mem'.  `offset' is its top.
-   * The node table grows downwards, from the end of the region.
-     `meta' is its size in bytes.
+     `offset' is the top of the data area.
+
+   * The BOOKKEEPING CHUNKS: separate regions, mapped on demand, that
+     hold the nodes and the refs.  They are chained through `tab',
+     newest first, and they NEVER count against the data capacity.
 
    Every allocation is described by a NODE, which stores an address and
    a size ("9 until 103", for instance), and by a REF, the small handle
-   that `alloc' returns to the user (see `nashj.h').  Both live inside
-   the nashj itself, in the node table, so no external allocator is
-   needed.  Nodes are kept in three singly linked lists:
+   that `alloc' returns to the user (see `nashj.h').  Both live in the
+   bookkeeping chunks, so no external allocator is needed.  Nodes are
+   kept in three singly linked lists:
 
    * `used_list'  - live allocations.  Freeing looks up the pointer
                     here; the address found IS the identity, and the
@@ -99,8 +104,8 @@
 
    Refs are different: a ref must keep telling "this address was
    freed" AFTER the free, so it can never be recycled.  Each `alloc'
-   therefore consumes one ref from the node table until `reset' or
-   `destroy'.
+   therefore consumes one ref from the bookkeeping chunks until `reset'
+   or `destroy'.
 
    Freed ranges have no "chunk" concept: a range is just an address
    and a length, and may be split or merged freely.
@@ -361,22 +366,12 @@ mangled(munmap) (mangled(addr) ptr, size_t length)
 
    From this point on, the code is completely platform independent.  */
 
-/* Return the usable size of the nashj, rounded DOWN to a multiple of
-   NASHJ_ALIGN.  The node table is anchored at this boundary, which
-   keeps every entry of the table naturally aligned: nodes and refs
-   have sizes that are multiples of 8, and the boundary is a multiple
-   of NASHJ_ALIGN.  */
-static inline size_t
-mangled(limit) (mangled(t) *a)
-{   return a->capacity & ~(size_t)(NASHJ_ALIGN - 1);
-}
-
-/* Return how many bytes are still untouched between the top of the
-   data area and the bottom of the node table.  This is the room
-   available for new data AND for new table entries.  */
+/* Return how many bytes of the data area are still untouched.  Only
+   user data lives there, so this is exactly what `alloc' may still
+   hand out.  */
 static inline size_t
 mangled(room) (mangled(t) *a)
-{   return mangled(limit)(a) - a->offset - a->meta;
+{   return a->capacity - a->offset;
 }
 
 /* Fill the N bytes starting at P with zeros.
@@ -401,20 +396,41 @@ mangled(copy) (mangled(byte) *dst, const mangled(byte) *src, size_t n)
     while( n-- ) *v++ = *src++;
 }
 
-/* Grow the node table downwards by SIZE bytes and return the new
-   entry.  The caller MUST have checked `room' before; nothing is
-   verified here.  */
+/* Make sure that the current bookkeeping chunk has at least SIZE free
+   bytes, mapping a new chunk when it does not.
+
+   Returns 0 on success and -1 if the system refuses the new chunk.
+   Nothing is changed on failure.  The old chunk is kept, so nodes and
+   refs that already live in it never move.  */
+static inline int
+mangled(table_reserve) (mangled(t) *a, size_t size)
+{   if( a->tab && a->tab->size - a->tab_used >= size ) return 0;
+    size_t want = sizeof(mangled(chunk)) + size;
+    size_t len = want > NASHJ_CHUNK ? want : NASHJ_CHUNK;
+    mangled(chunk) *c = (mangled(chunk)*) mangled(mmap) (NULL, len);
+    if( !c ) return -1;
+    c->prev = a->tab;
+    c->size = len;
+    a->tab = c;
+    a->tab_used = sizeof(mangled(chunk));
+    return 0;
+}
+
+/* Take SIZE bytes from the current bookkeeping chunk and return them.
+   The caller MUST have called `table_reserve' for at least SIZE bytes
+   before; nothing is verified here.  */
 static inline mangled(addr)
 mangled(table_get) (mangled(t) *a, size_t size)
-{   a->meta += size;
-    return a->mem + mangled(limit)(a) - a->meta;
+{   mangled(byte) *p = (mangled(byte)*) a->tab + a->tab_used;
+    a->tab_used += size;
+    return p;
 }
 
 /* Obtain a node to describe an allocation or a free range.
 
    A recycled node from the `spare' list is preferred.  Only when none
-   is available does the node table grow.  The caller MUST have checked
-   that there is room for `node_cost' bytes.  */
+   is available does the bookkeeping grow.  The caller MUST have
+   reserved `node_cost' bytes before.  */
 static inline mangled(node)*
 mangled(node_get) (mangled(t) *a)
 {   mangled(node) *n = a->spare;
@@ -422,15 +438,31 @@ mangled(node_get) (mangled(t) *a)
     return (mangled(node)*) mangled(table_get)(a, sizeof(mangled(node)));
 }
 
-/* Return how many bytes of the node table `node_get' will consume
+/* Return how many bytes of the bookkeeping `node_get' will consume
    right now: zero when a spare node is available.  */
 static inline size_t
 mangled(node_cost) (mangled(t) *a)
 {   return a->spare ? 0 : sizeof(mangled(node));
 }
 
+/* Unmap every bookkeeping chunk.  Returns non-zero if the system
+   refused any of them.  Every node and ref dies with the chunks.  */
+static inline int
+mangled(table_free) (mangled(t) *a)
+{   int bad = 0;
+    mangled(chunk) *c = a->tab;
+    while( c ) {
+        mangled(chunk) *prev = c->prev;
+        if( mangled(munmap)(c, c->size) ) bad = 1;
+        c = prev;
+    }
+    a->tab = NULL;
+    a->tab_used = 0;
+    return bad;
+}
+
 /* Give a node that is no longer needed back to the `spare' list, so
-   that `node_get' can reuse it.  The node table itself never shrinks
+   that `node_get' can reuse it.  The bookkeeping chunks never shrink
    (except through `reset'), which is why recycling matters.  */
 static inline void
 mangled(node_put) (mangled(t) *a, mangled(node) *n)
@@ -438,11 +470,12 @@ mangled(node_put) (mangled(t) *a, mangled(node) *n)
     a->spare = n;
 }
 
-/* Report that `alloc' ran out of room and return NULL, so that every
-   failure path of `alloc' can say `return no_room ()'.  */
+/* Report that `alloc' ran out of room in the data area and return
+   NULL, so that every failure path of `alloc' can say
+   `return no_room ()'.  */
 static inline mangled(ref)*
 mangled(no_room) (void)
-{   runtime_error(LIB)("Out of memory: no room left for the allocation and its bookkeeping.");
+{   runtime_error(LIB)("Out of memory: no room left in the data area for the allocation.");
     return NULL;
 }
 
@@ -452,9 +485,13 @@ mangled(no_room) (void)
    Every function below is declared in `nashj.h' through the
    `FUNCTIONS' X-macro.  */
 
-/* Create a nashj backed by BYTES bytes obtained from the operating
+/* Create a nashj with BYTES bytes of DATA obtained from the operating
    system.  The nashj is returned BY VALUE; the caller owns it and must
    eventually pass it to `destroy'.
+
+   BYTES is exactly the data capacity: the nodes and refs that
+   describe the allocations live in separate bookkeeping chunks, which
+   are mapped on demand and never take room from the data area.
 
    If the system refuses the request, a runtime error is emitted and the
    returned nashj has `capacity' == 0, so every later `alloc' on it
@@ -483,9 +520,9 @@ mangled(start) (size_t bytes)
    and the `freed' flag.  Use `makeraw' to get the plain address.
 
    Returns NULL, after emitting a runtime error, if SIZE is zero, if it
-   is absurdly large, or if the nashj has no room left for the data
-   plus its bookkeeping (a node, unless a spare one exists, and the
-   ref).  Nothing is modified when NULL is returned.  */
+   is absurdly large, if the data area has no room left for the
+   (rounded) size, or if the system refuses the memory for the
+   bookkeeping.  Nothing is modified when NULL is returned.  */
 inline mangled(ref)*
 mangled(alloc) (mangled(t) *a, size_t size)
 {   /* Reject zero, and sizes that would overflow when rounded up.  */
@@ -498,7 +535,6 @@ mangled(alloc) (mangled(t) *a, size_t size)
         return NULL;
     }
     size_t total = NASHJ_NORM(size);
-    size_t room = mangled(room)(a);
     size_t refs = sizeof(mangled(ref));
 
     /* Step 1: look for a suitable free range (first fit).  `link'
@@ -507,34 +543,36 @@ mangled(alloc) (mangled(t) *a, size_t size)
     mangled(node) **link = &a->free_list;
     while( *link && (*link)->size < total ) link = &(*link)->next;
     mangled(node) *n = *link;
+    int perfect = n && n->size == total;
 
-    /* All the room checks happen BEFORE anything is touched, so a
-       failure leaves the nashj exactly as it was.  */
+    /* All the checks happen BEFORE anything is touched, so a failure
+       leaves the nashj exactly as it was.  First the data room (only
+       when the top of the data area has to grow), then the room for
+       the bookkeeping.  A perfect fit reuses the free node itself.  */
+    if( !n && total > mangled(room)(a) ) return mangled(no_room)();
+    size_t need = refs + (perfect ? 0 : mangled(node_cost)(a));
+    if( mangled(table_reserve)(a, need) ) {
+        runtime_error(LIB)("Could not obtain memory for the bookkeeping.");
+        return NULL;
+    }
+
     mangled(node) *r;
-    mangled(ref) *h;
-    if( n && n->size == total ) {
-        /* Perfect fit: the free node itself becomes the allocation
-           node, so no new node is needed.  */
-        if( room < refs ) return mangled(no_room)();
-        h = (mangled(ref)*) mangled(table_get)(a, refs);
+    mangled(ref) *h = (mangled(ref)*) mangled(table_get)(a, refs);
+    if( perfect ) {
+        /* The free node itself becomes the allocation node.  */
         *link = n->next;                    /* unlink from free list    */
         r = n;
     } else if( n ) {
         /* The range is larger than needed: carve the allocation out
            of its front.  A fresh node describes the allocation, and
            the free range just loses the bytes we took.  */
-        if( room < mangled(node_cost)(a) + refs ) return mangled(no_room)();
         r = mangled(node_get)(a);
-        h = (mangled(ref)*) mangled(table_get)(a, refs);
         r->addr = n->addr;
         n->addr += total;
         n->size -= total;
     } else {
         /* Step 2: no free range fits, so grow the data area.  */
-        if( room < total || room - total < mangled(node_cost)(a) + refs )
-            return mangled(no_room)();
         r = mangled(node_get)(a);
-        h = (mangled(ref)*) mangled(table_get)(a, refs);
         r->addr = a->mem + a->offset;
         a->offset += total;
     }
@@ -721,17 +759,19 @@ mangled(coalesce) (mangled(t) *a)
     return 0;
 }
 
-/* Forget every allocation at once, keeping the underlying memory.
+/* Forget every allocation at once, keeping the data region.
 
-   The nashj goes back to its just-started state: the data area and the
-   node table are empty, and all three lists are dropped.  Every
-   pointer and every handle previously returned by `alloc' becomes
-   invalid.  This is the classic "free everything" operation of arena
-   allocators, and it runs in constant time.  */
+   The nashj goes back to its just-started state: the data area is
+   empty, the bookkeeping chunks are returned to the system, and all
+   three lists are dropped.  Every pointer and every handle previously
+   returned by `alloc' becomes invalid.  This is the classic "free
+   everything" operation of arena allocators, and it takes time
+   proportional to the number of bookkeeping chunks (usually one).  */
 inline void
 mangled(reset) (mangled(t) *a)
-{   a->offset = 0;
-    a->meta = 0;
+{   if( mangled(table_free)(a) )
+        runtime_error(LIB)("Could not return the bookkeeping memory to the operating system.");
+    a->offset = 0;
     a->free_list = a->used_list = a->spare = NULL;
 }
 
@@ -744,10 +784,12 @@ mangled(reset) (mangled(t) *a)
    error is emitted, but A is cleared anyway.  */
 inline void
 mangled(destroy) (mangled(t) *a)
-{   if( a->mem && mangled(munmap)(a->mem, a->capacity) )
+{   int bad = mangled(table_free)(a);
+    if( a->mem && mangled(munmap)(a->mem, a->capacity) ) bad = 1;
+    if( bad )
         runtime_error(LIB)("Could not return the memory to the operating system.");
     a->mem = NULL;
-    a->capacity = a->offset = a->meta = 0;
+    a->capacity = a->offset = 0;
     a->free_list = a->used_list = a->spare = NULL;
 }
 

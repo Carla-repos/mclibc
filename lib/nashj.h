@@ -90,8 +90,9 @@ typedef struct mangled(ref) {
 
    There is no concept of chunk or block with a header.  A node is just
    an address and a length, and the same structure describes both live
-   allocations and freed ranges.  Nodes are stored INSIDE the nashj, at
-   its end, so no external allocator is needed to manage them.
+   allocations and freed ranges.  Nodes are stored in the bookkeeping
+   chunks (see `chunk' below), so no external allocator is needed to
+   manage them and they never take room from the user's data.
 
    The same node lives in exactly one of three lists (see `t' below).  */
 
@@ -105,32 +106,48 @@ typedef struct mangled(node) {
 } mangled(node);
 
 /* ---------------------------------------------------------------------
+   Chunk: one region of bookkeeping.
+
+   The nodes and the refs live in chunks, mapped on demand and chained
+   newest first.  A chunk is mapped separately from the data region, so
+   the bookkeeping NEVER takes room from the data capacity.  The chunk
+   header is followed by the entries, handed out from `tab_used'.  */
+
+typedef struct mangled(chunk) {
+    struct mangled(chunk) *prev;    /* older chunk, or NULL.             */
+    size_t size;                    /* size of this chunk, header too.   */
+} mangled(chunk);
+
+/* ---------------------------------------------------------------------
    Nashj: the state of one allocator.
 
-   The nashj is ONE contiguous region obtained from the operating
-   system.  Inside it, two areas grow towards each other:
+   The nashj owns two kinds of memory.  The DATA REGION is ONE
+   contiguous region obtained from the operating system, with exactly
+   the size given to `start'.  It holds user data and nothing else:
 
        low addresses                                    high addresses
-       +--------------------+-----------------+----------------------+
-       | user data  ->      |   (free room)   |      <-  node table  |
-       +--------------------+-----------------+----------------------+
-       ^ mem                ^ mem+offset        ^ mem+limit-meta       ^ mem+limit
+       +--------------------------+---------------------------------+
+       | user data  ->            |           (free room)           |
+       +--------------------------+---------------------------------+
+       ^ mem                      ^ mem+offset                      ^ mem+capacity
 
-   The node table holds both nodes and refs.  The struct is small and
-   is returned BY VALUE from `start'; every other function receives a
-   pointer to it.  A zero-filled struct is a valid, empty nashj that
-   has no memory (every `alloc' on it fails).  */
+   The BOOKKEEPING CHUNKS, which hold nodes and refs, are separate.
+
+   The struct is small and is returned BY VALUE from `start'; every
+   other function receives a pointer to it.  A zero-filled struct is a
+   valid, empty nashj that has no memory (every `alloc' on it fails).  */
 
 typedef struct mangled(t) {
-    mangled(byte) *mem;         /* base of the region given by the OS.   */
-    size_t capacity;            /* size of that region, in bytes.        */
+    mangled(byte) *mem;         /* base of the data region.              */
+    size_t capacity;            /* size of the data region, in bytes:
+                                   the most user data it can hold.       */
 
     size_t offset;              /* top of the data area.  It grows
                                    upwards; everything below it has been
                                    handed out at least once.             */
-    size_t meta;                /* bytes used by the node table at the
-                                   end of the region.  It grows
-                                   downwards.                            */
+    mangled(chunk) *tab;        /* newest bookkeeping chunk, or NULL.    */
+    size_t tab_used;            /* bytes used in that chunk, header
+                                   included.                             */
 
     mangled(node) *free_list;   /* ranges that were freed, sorted by
                                    address and merged with their
@@ -152,23 +169,21 @@ typedef struct mangled(t) {
 
 #define NASHJ_ALIGN 16
 
-/* Round the request N up to the size that is really reserved.
+/* Size of the bookkeeping chunks that the nashj maps on demand.  A
+   bigger chunk is mapped when one entry does not fit in this size.  */
 
-   Two things happen, in this order:
+#define NASHJ_CHUNK 4096
 
-     1. N is raised to at least sizeof (node).  This is a minimum
-        block size that fits a node.
+/* Round the request N up to the size that is really reserved: the
+   next multiple of NASHJ_ALIGN, with the usual trick
+   `(x + A - 1) & ~(A - 1)', valid because A is a power of two.
 
-     2. The result is rounded UP to the next multiple of NASHJ_ALIGN,
-        with the usual trick `(x + A - 1) & ~(A - 1)', valid because A
-        is a power of two.
-
-   The macro evaluates N more than once, so N must not have side
-   effects.  */
+   There is no minimum block size, because the nodes are not stored
+   inside the freed blocks.  The macro evaluates N more than once, so N
+   must not have side effects.  */
 
 #define NASHJ_NORM(n)                                               \
-    ( ( ((n) < sizeof(mangled(node)) ? sizeof(mangled(node)) : (n)) \
-        + NASHJ_ALIGN - 1 ) & ~(size_t)(NASHJ_ALIGN - 1) )
+    ( ((n) + NASHJ_ALIGN - 1) & ~(size_t)(NASHJ_ALIGN - 1) )
 
 /* ---------------------------------------------------------------------
    Public functions, listed as an X-macro.
@@ -179,7 +194,8 @@ typedef struct mangled(t) {
    the contract of each function is documented in `nashj.c', next to its
    definition.
 
-     start    Create a nashj backed by BYTES bytes from the OS.
+     start    Create a nashj with BYTES bytes of data from the OS.  The
+              bookkeeping is extra and never counts against BYTES.
      alloc    Allocate SIZE zero-filled bytes; returns a handle, or
               NULL if there is no room.
      makeraw  Return the plain address stored in a handle (NULL if the
