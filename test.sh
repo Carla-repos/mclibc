@@ -1,12 +1,12 @@
-gcc -nostdlib -O0 -c -I./lib lib/arena.c -o ./build/arena.o
-echo did build arena
+gcc -nostdlib -O0 -c -I./lib lib/nashj.c -o ./build/nashj.o
+echo did build nashj
 
 gcc -nostdlib -O0 -c -I./lib lib/development.c -o ./build/development.o
 echo did build development
 
-gcc -O0 -c -I./lib tests/main.c -o ./build/tests.o
+g++ -O0 -c -I./lib tests/main.cpp -o ./build/tests.o -lstdc++ -pthread
 
-gcc -fsanitize=address ./build/arena.o ./build/development.o ./build/tests.o -o ./build/final
+g++ -fsanitize=address ./build/nashj.o ./build/development.o ./build/tests.o -o ./build/final
 
 echo "press some key to run the file"
 read

@@ -1,4 +1,5 @@
-/* arena.c -- Arena allocator with a free list and no per-block headers.
+//h: errors
+/* nashj.c -- Nashj (نسج) allocator: a free list and no per-block headers.
 
    Author:  contato.lucasdwbfff@gmail.com
 
@@ -7,6 +8,10 @@
    mclibc is a MINIMAL package of functions that ships bundled with
    Carla, the programming language.  Everything in mclibc is written to
    be tiny, dependency free (no libc, no malloc) and easy to audit.
+
+   Nashj (نسج) is the Arabic word for "weaving".  The allocator weaves
+   live allocations, free ranges and their bookkeeping into one single
+   region of memory, and `coalesce' re-weaves it without gaps.
 
    ---------------------------------------------------------------------
    CODE CONVENTIONS (READ THIS BEFORE WRITING ANY "stdlibcore" LIB)
@@ -18,9 +23,9 @@
    that can be observed here are:
 
    1. Namespacing.  Every public or internal identifier is spelled
-      through the `mangled (id)' macro, defined in the lib's own header
-      (here, `arena.h').  For this lib, `mangled (alloc)' expands to
-      `arena_alloc'.  Changing the prefix means changing ONE macro.
+      through the `mangled(id)' macro, defined in the lib's own header
+      (here, `nashj.h').  For this lib, `mangled(alloc)' expands to
+      `nashj_alloc'.  Changing the prefix means changing ONE macro.
 
    2. Public API through an X-macro.  The header lists every public
       function once, in a `FUNCTIONS' table, and expands it to emit the
@@ -33,7 +38,7 @@
       spaces and the first statement:
 
           inline void
-          mangled (name) (arguments)
+          mangled(name) (arguments)
           {   first_statement;
               ...
           }
@@ -52,11 +57,17 @@
       period, and the closing marker of a multi-line comment on the
       last line of text.
 
+   8. Runtime errors are reported through `errors.h', as
+      `runtime_error (LIB) ("message")', with LIB defined as the name of
+      the lib.  The code that follows the call still returns a safe
+      value, so the function behaves well even if the error handler
+      comes back.
+
    ---------------------------------------------------------------------
    DESIGN OVERVIEW
    ---------------------------------------------------------------------
 
-   The arena is ONE contiguous region obtained from the operating
+   The nashj is ONE contiguous region obtained from the operating
    system.  Inside that region, the memory is split in two areas that
    grow towards each other:
 
@@ -72,8 +83,8 @@
 
    Every allocation is described by a NODE, which stores an address and
    a size ("9 until 103", for instance), and by a REF, the small handle
-   that `alloc' returns to the user (see `arena.h').  Both live inside
-   the arena itself, in the node table, so no external allocator is
+   that `alloc' returns to the user (see `nashj.h').  Both live inside
+   the nashj itself, in the node table, so no external allocator is
    needed.  Nodes are kept in three singly linked lists:
 
    * `used_list'  - live allocations.  Freeing looks up the pointer
@@ -94,34 +105,41 @@
    Freed ranges have no "chunk" concept: a range is just an address
    and a length, and may be split or merged freely.
 
+   `coalesce' slides the live allocations down to close the gaps that
+   `dump' left between them.  Handles survive it (their address is
+   updated); raw addresses obtained from `makeraw' do not.
+
    Every byte handed out by `alloc' is zero-filled, no matter whether
    it comes from fresh pages, from a reused free range, or from a data
    area that `dump' gave back.  */
 
-#include "arena.h"
+#include "nashj.h"
 #include <stddef.h>
+
+#define LIB nashj
+#include "errors.h"
 
 /* ---------------------------------------------------------------------
    Platform detection.
 
-   Exactly one of ARENA_OS_WINDOWS or ARENA_OS_LINUX is defined here.
+   Exactly one of NASHJ_OS_WINDOWS or NASHJ_OS_LINUX is defined here.
    `_WIN32' is set by every Windows compiler (MSVC, MinGW, clang-cl) for
    both 32 and 64 bit targets, unlike `WIN32', which usually comes from
    the project files.  Any other system is rejected at compile time
    instead of failing mysteriously at run time.  */
 
 #if defined(_WIN32)
-#define ARENA_OS_WINDOWS 1
+#define NASHJ_OS_WINDOWS 1
 /* Trim <windows.h> down to the parts that we really need.  */
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
 #elif defined(__linux__)
-#define ARENA_OS_LINUX 1
+#define NASHJ_OS_LINUX 1
 #include "syscall.h"
 #else
-#error "arena: os not supported"
+#error "nashj: os not supported"
 #endif
 
 /* =====================================================================
@@ -132,7 +150,7 @@
    `sys_munmap', and the common code further below turns them into the
    portable `mmap' and `munmap' used by the rest of the file.  */
 
-#if defined(ARENA_OS_LINUX)
+#if defined(NASHJ_OS_LINUX)
 
 /* Values from the Linux kernel ABI (<sys/mman.h>).  They are repeated
    here so that this file does not depend on any libc header.
@@ -167,7 +185,7 @@
    -1..-4095; it does NOT touch any `errno' variable, since there is
    no libc here.  */
 static inline long
-mangled (mclibcsys6) (
+mangled(mclibcsys6) (
     long number,
     long a1, long a2, long a3,
     long a4, long a5, long a6
@@ -233,7 +251,7 @@ mangled(sys_munmap) (mangled(addr) ptr, size_t length)
    is saved with `pushl', loaded by hand, and restored with `popl'
    around the interrupt.  */
 static inline long
-mangled (mclibcsys3) (long number, long a1, long a2, long a3)
+mangled(mclibcsys3) (long number, long a1, long a2, long a3)
 {   long result;
     __asm__ volatile (
         "pushl %%ebx\n\t"       /* save the PIC register                */
@@ -279,7 +297,7 @@ mangled(sys_munmap) (mangled(addr) ptr, size_t length)
 }
 
 #else
-#error "arena: Arch Linux not supported"
+#error "nashj: Arch Linux not supported"
 #endif
 
 /* ---------------------------------------------------------------------
@@ -313,7 +331,7 @@ mangled(munmap) (mangled(addr) ptr, size_t length)
    Windows has no raw system call ABI that is stable across versions,
    so the documented Win32 virtual memory API is used instead.  */
 
-#elif defined(ARENA_OS_WINDOWS)
+#elif defined(NASHJ_OS_WINDOWS)
 
 /* Map LENGTH bytes of fresh memory.  MEM_RESERVE | MEM_COMMIT gets the
    address range and the backing storage in a single call, and the
@@ -343,14 +361,14 @@ mangled(munmap) (mangled(addr) ptr, size_t length)
 
    From this point on, the code is completely platform independent.  */
 
-/* Return the usable size of the arena, rounded DOWN to a multiple of
-   ARENA_ALIGN.  The node table is anchored at this boundary, which
+/* Return the usable size of the nashj, rounded DOWN to a multiple of
+   NASHJ_ALIGN.  The node table is anchored at this boundary, which
    keeps every entry of the table naturally aligned: nodes and refs
    have sizes that are multiples of 8, and the boundary is a multiple
-   of ARENA_ALIGN.  */
+   of NASHJ_ALIGN.  */
 static inline size_t
 mangled(limit) (mangled(t) *a)
-{   return a->capacity & ~(size_t)(ARENA_ALIGN - 1);
+{   return a->capacity & ~(size_t)(NASHJ_ALIGN - 1);
 }
 
 /* Return how many bytes are still untouched between the top of the
@@ -370,6 +388,17 @@ static inline void
 mangled(zero) (mangled(byte) *p, size_t n)
 {   volatile mangled(byte) *v = p;
     while( n-- ) *v++ = 0;
+}
+
+/* Copy N bytes from SRC to DST.  The two ranges must not overlap.
+
+   As in `zero', the stores go through a `volatile' pointer so that the
+   compiler cannot turn the loop into a call to `memcpy', which does not
+   exist here because there is no libc.  */
+static inline void
+mangled(copy) (mangled(byte) *dst, const mangled(byte) *src, size_t n)
+{   volatile mangled(byte) *v = dst;
+    while( n-- ) *v++ = *src++;
 }
 
 /* Grow the node table downwards by SIZE bytes and return the new
@@ -409,31 +438,41 @@ mangled(node_put) (mangled(t) *a, mangled(node) *n)
     a->spare = n;
 }
 
+/* Report that `alloc' ran out of room and return NULL, so that every
+   failure path of `alloc' can say `return no_room ()'.  */
+static inline mangled(ref)*
+mangled(no_room) (void)
+{   runtime_error(LIB)("Out of memory: no room left for the allocation and its bookkeeping.");
+    return NULL;
+}
+
 /* =====================================================================
    PUBLIC API
 
-   Every function below is declared in `arena.h' through the
+   Every function below is declared in `nashj.h' through the
    `FUNCTIONS' X-macro.  */
 
-/* Create an arena backed by BYTES bytes obtained from the operating
-   system.  The arena is returned BY VALUE; the caller owns it and must
+/* Create a nashj backed by BYTES bytes obtained from the operating
+   system.  The nashj is returned BY VALUE; the caller owns it and must
    eventually pass it to `destroy'.
 
-   If the system refuses the request, the returned arena has
-   `capacity' == 0 and every later `alloc' on it returns NULL, so the
-   failure needs no special handling by the caller.  */
+   If the system refuses the request, a runtime error is emitted and the
+   returned nashj has `capacity' == 0, so every later `alloc' on it
+   fails too and the caller needs no special handling.  */
 inline mangled(t)
 mangled(start) (size_t bytes)
-{   mangled(t) arena = {0};     /* all lists start empty (NULL)         */
-    arena.mem = mangled(mmap) (NULL, bytes);
-    arena.capacity = arena.mem ? bytes : 0;
-    return arena;
+{   mangled(t) nashj = {0};     /* all lists start empty (NULL)         */
+    nashj.mem = mangled(mmap) (NULL, bytes);
+    if( !nashj.mem )
+        runtime_error(LIB)("Could not obtain memory from the operating system.");
+    nashj.capacity = nashj.mem ? bytes : 0;
+    return nashj;
 }
 
-/* Allocate SIZE bytes from the arena A, all of them set to zero.
+/* Allocate SIZE bytes from the nashj A, all of them set to zero.
 
-   The size is rounded up to a multiple of ARENA_ALIGN, so every
-   returned address is ARENA_ALIGN-byte aligned.  The strategy is:
+   The size is rounded up to a multiple of NASHJ_ALIGN, so every
+   returned address is NASHJ_ALIGN-byte aligned.  The strategy is:
 
      1. First fit over the free list.  A range that is a perfect fit is
         promoted to a live allocation as is.  A larger range is split:
@@ -443,15 +482,22 @@ mangled(start) (size_t bytes)
    The result is a pointer to a REF: the handle that stores the address
    and the `freed' flag.  Use `makeraw' to get the plain address.
 
-   Returns NULL if SIZE is zero, if it is absurdly large, or if the
-   arena has no room left for the data plus its bookkeeping (a node,
-   unless a spare one exists, and the ref).  Nothing is modified when
-   NULL is returned.  */
+   Returns NULL, after emitting a runtime error, if SIZE is zero, if it
+   is absurdly large, or if the nashj has no room left for the data
+   plus its bookkeeping (a node, unless a spare one exists, and the
+   ref).  Nothing is modified when NULL is returned.  */
 inline mangled(ref)*
 mangled(alloc) (mangled(t) *a, size_t size)
 {   /* Reject zero, and sizes that would overflow when rounded up.  */
-    if( size == 0 || size > (size_t)-1 - ARENA_ALIGN ) return NULL;
-    size_t total = ARENA_NORM(size);
+    if( size == 0 ) {
+        runtime_error(LIB)("Can't allocate zero bytes.");
+        return NULL;
+    }
+    if( size > (size_t)-1 - NASHJ_ALIGN ) {
+        runtime_error(LIB)("The requested size is too large.");
+        return NULL;
+    }
+    size_t total = NASHJ_NORM(size);
     size_t room = mangled(room)(a);
     size_t refs = sizeof(mangled(ref));
 
@@ -463,13 +509,13 @@ mangled(alloc) (mangled(t) *a, size_t size)
     mangled(node) *n = *link;
 
     /* All the room checks happen BEFORE anything is touched, so a
-       failure leaves the arena exactly as it was.  */
+       failure leaves the nashj exactly as it was.  */
     mangled(node) *r;
     mangled(ref) *h;
     if( n && n->size == total ) {
         /* Perfect fit: the free node itself becomes the allocation
            node, so no new node is needed.  */
-        if( room < refs ) return NULL;
+        if( room < refs ) return mangled(no_room)();
         h = (mangled(ref)*) mangled(table_get)(a, refs);
         *link = n->next;                    /* unlink from free list    */
         r = n;
@@ -477,7 +523,7 @@ mangled(alloc) (mangled(t) *a, size_t size)
         /* The range is larger than needed: carve the allocation out
            of its front.  A fresh node describes the allocation, and
            the free range just loses the bytes we took.  */
-        if( room < mangled(node_cost)(a) + refs ) return NULL;
+        if( room < mangled(node_cost)(a) + refs ) return mangled(no_room)();
         r = mangled(node_get)(a);
         h = (mangled(ref)*) mangled(table_get)(a, refs);
         r->addr = n->addr;
@@ -486,7 +532,7 @@ mangled(alloc) (mangled(t) *a, size_t size)
     } else {
         /* Step 2: no free range fits, so grow the data area.  */
         if( room < total || room - total < mangled(node_cost)(a) + refs )
-            return NULL;
+            return mangled(no_room)();
         r = mangled(node_get)(a);
         h = (mangled(ref)*) mangled(table_get)(a, refs);
         r->addr = a->mem + a->offset;
@@ -508,11 +554,19 @@ mangled(alloc) (mangled(t) *a, size_t size)
 
 /* Return the plain address stored in the handle H.
 
-   Returns NULL if H is NULL or if the allocation has already been
-   freed, so a stale handle can never be used by mistake.  */
+   Returns NULL, after emitting a runtime error, if H is NULL or if the
+   allocation has already been freed, so a stale handle can never be
+   used by mistake.  */
 inline mangled(addr)
 mangled(makeraw) (mangled(ref) *h)
-{   if( !h || h->freed ) return NULL;
+{   if( !h ) {
+        runtime_error(LIB)("Null handle. It has no address.");
+        return NULL;
+    }
+    if( h->freed ) {
+        runtime_error(LIB)("Address already freed. You can't get its raw address.");
+        return NULL;
+    }
     return h->ptr;
 }
 
@@ -520,9 +574,10 @@ mangled(makeraw) (mangled(ref) *h)
 
    The allocation is looked up in the used list by ADDRESS: the node
    whose address equals `H->ptr' (and whose handle is H) holds the size
-   of the allocation.  A NULL handle, or a handle that is already
-   marked as freed (a double free), is silently ignored, leaving the
-   arena untouched.  So is a handle that does not belong to this arena.
+   of the allocation.  A NULL handle is ignored, like `free (NULL)'.  A
+   handle that is already marked as freed (a double free), or that does
+   not belong to this nashj, emits a runtime error and leaves the
+   nashj untouched.
 
    The handle is marked as freed.  The freed range is then inserted in
    the free list, keeping it sorted by address, and merged with the
@@ -531,7 +586,11 @@ mangled(makeraw) (mangled(ref) *h)
    is handed back to the untouched region by lowering `offset'.  */
 inline void
 mangled(dump) (mangled(t) *a, mangled(ref) *h)
-{   if( !h || h->freed ) return;
+{   if( !h ) return;
+    if( h->freed ) {
+        runtime_error(LIB)("Address already freed. You can't free it twice.");
+        return;
+    }
 
     /* Find the node of this handle and detach it from the used list.
        R stays NULL if there is no such node.  */
@@ -543,7 +602,10 @@ mangled(dump) (mangled(t) *a, mangled(ref) *h)
         break;
     }
 
-    if( !r ) return;    /* not ours: nothing to do                      */
+    if( !r ) {          /* not ours: nothing to do                      */
+        runtime_error(LIB)("This handle does not belong to this allocator.");
+        return;
+    }
 
     /* The handle outlives the node, so it is marked here, before the
        node is merged or recycled.  */
@@ -590,13 +652,82 @@ mangled(dump) (mangled(t) *a, mangled(ref) *h)
     }
 }
 
+/* Slide every live allocation down, closing all the gaps that `dump'
+   left between them.
+
+       memory: |xxxxxx|....|xxxxxxx|.........|
+       result: |xxxxxx|xxxxxxx|.............|
+
+   The data area is first copied, byte by byte, to a temporary region
+   obtained from the operating system.  Every live allocation is then
+   copied back from that snapshot to its new, lower address: the old
+   address minus the total size of the free ranges below it.  Because
+   the moves always read from the snapshot, they can be done in any
+   order and can never overwrite data that is still waiting to be
+   moved.  The snapshot is returned to the system before the function
+   ends.  Only the data bytes need a snapshot: the nodes and handles
+   are updated in place.
+
+   Afterwards the free list is empty (its nodes are recycled) and
+   `offset' is lowered by the size of all the gaps.
+
+   Handles stay valid, because their `ptr' is updated.  Every raw
+   address obtained before with `makeraw' is INVALID after this call
+   and must be fetched again.
+
+   Returns 0 on success, which includes the case of a nashj without
+   gaps.  Returns -1, after emitting a runtime error, if the temporary
+   region cannot be obtained; in that case nothing has been touched.  */
+inline int
+mangled(coalesce) (mangled(t) *a)
+{   if( !a->free_list ) return 0;           /* no gaps: nothing to do   */
+
+    /* Step 1: snapshot of the whole data area.  Everything below
+       `offset' is either live or free, and the free ranges are about
+       to be overwritten, so the copy covers all of it.  */
+    size_t used = a->offset;
+    mangled(byte) *snap = mangled(mmap) (NULL, used);
+    if( !snap ) {
+        runtime_error(LIB)("Could not obtain the temporary copy. Nothing was moved.");
+        return -1;
+    }
+    mangled(copy)(snap, a->mem, used);
+
+    /* Step 2: move every live allocation.  The free list is sorted by
+       address, so the walk stops at the first range above the node.  */
+    for( mangled(node) *n = a->used_list; n; n = n->next ) {
+        size_t shift = 0;
+        for( mangled(node) *f = a->free_list; f && f->addr < n->addr; f = f->next )
+            shift += f->size;
+        if( shift == 0 ) continue;          /* below every gap: stays   */
+
+        mangled(byte) *old = n->addr;
+        n->addr = old - shift;
+        mangled(copy)(n->addr, snap + (old - a->mem), n->size);
+        n->ref->ptr = n->addr;              /* keep the handle in sync  */
+    }
+
+    /* Step 3: the gaps are gone.  Recycle their nodes and lower the
+       top of the data area by their total size.  */
+    while( a->free_list ) {
+        mangled(node) *f = a->free_list;
+        a->free_list = f->next;
+        a->offset -= f->size;
+        mangled(node_put)(a, f);
+    }
+
+    if( mangled(munmap)(snap, used) )
+        runtime_error(LIB)("Could not release the temporary copy.");
+    return 0;
+}
+
 /* Forget every allocation at once, keeping the underlying memory.
 
-   The arena goes back to its just-started state: the data area and the
+   The nashj goes back to its just-started state: the data area and the
    node table are empty, and all three lists are dropped.  Every
    pointer and every handle previously returned by `alloc' becomes
-   invalid.  This is the classic arena "free everything" operation, and
-   it runs in constant time.  */
+   invalid.  This is the classic "free everything" operation of arena
+   allocators, and it runs in constant time.  */
 inline void
 mangled(reset) (mangled(t) *a)
 {   a->offset = 0;
@@ -604,16 +735,20 @@ mangled(reset) (mangled(t) *a)
     a->free_list = a->used_list = a->spare = NULL;
 }
 
-/* Return the whole arena to the operating system.
+/* Return the whole nashj to the operating system.
 
    After this call, A is left in a safe, empty state (`capacity' is
    zero and `mem' is NULL), so a repeated `destroy' or a later `alloc'
-   is harmless, and any pointer or handle obtained from the arena is
-   invalid.  */
+   is harmless, and any pointer or handle obtained from the nashj is
+   invalid.  If the system refuses to take the memory back, a runtime
+   error is emitted, but A is cleared anyway.  */
 inline void
 mangled(destroy) (mangled(t) *a)
-{   if( a->mem ) mangled(munmap)(a->mem, a->capacity);
+{   if( a->mem && mangled(munmap)(a->mem, a->capacity) )
+        runtime_error(LIB)("Could not return the memory to the operating system.");
     a->mem = NULL;
     a->capacity = a->offset = a->meta = 0;
     a->free_list = a->used_list = a->spare = NULL;
 }
+
+#undef mangled
