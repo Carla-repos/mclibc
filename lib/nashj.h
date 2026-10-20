@@ -1,4 +1,4 @@
-/* nashj.h -- Public interface of the Nashj (نسج) allocator (no per-block headers).
+/* nashj.h -- Public interface of the Nashj (نشج) allocator (no per-block headers).
 
    Author:  contato.lucasdwbfff@gmail.com
 
@@ -8,7 +8,7 @@
    Carla, the programming language.  Everything in mclibc is written to
    be tiny, dependency free (no libc, no malloc) and easy to audit.
 
-   Nashj (نسج) is the Arabic word for "weaving".
+   Nashj (نشج) is the Arabic word for "weaving".
 
    The implementation lives in `nashj.c'.  This header only declares
    the types, the constants and the public functions.

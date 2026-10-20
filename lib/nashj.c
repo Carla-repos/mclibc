@@ -1,5 +1,5 @@
 //h: errors
-/* nashj.c -- Nashj (نسج) allocator: a free list and no per-block headers.
+/* nashj.c -- Nashj (نشج) allocator: a free list and no per-block headers.
 
    Author:  contato.lucasdwbfff@gmail.com
 
@@ -9,7 +9,7 @@
    Carla, the programming language.  Everything in mclibc is written to
    be tiny, dependency free (no libc, no malloc) and easy to audit.
 
-   Nashj (نسج) is the Arabic word for "weaving".  The allocator weaves
+   Nashj (نشج) is the Arabic word for "weaving".  The allocator weaves
    live allocations, free ranges and their bookkeeping into one single
    region of memory, and `coalesce' re-weaves it without gaps.
 
