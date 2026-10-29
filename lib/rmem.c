@@ -1,3 +1,4 @@
+//h: errors
 /* rmem.c -- Raw allocator: one mapping per block, refs in a global
    bookkeeping region.
 
