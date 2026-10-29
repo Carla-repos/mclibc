@@ -300,4 +300,22 @@ mangled(dump) (mangled(ref) *h)
         runtime_error(LIB)("Could not return the memory to the operating system.");
 }
 
+/* Return the plain address stored in the handle H.
+
+   Returns NULL, after emitting a runtime error, if H is NULL or if the
+   allocation has already been freed, so a stale handle can never be
+   used by mistake.  */
+inline mangled(addr)
+mangled(makeraw) (mangled(ref) *h)
+{   if( !h ) {
+        runtime_error(LIB)("Null handle. It has no address.");
+        return NULL;
+    }
+    if( h->freed ) {
+        runtime_error(LIB)("Address already freed. You can't get its raw address.");
+        return NULL;
+    }
+    return h->ptr;
+}
+
 #undef mangled

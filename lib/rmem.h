@@ -70,6 +70,7 @@ typedef struct mangled(ref) {
 #define FUNCTIONS                                                           \
 X(bookkeeping_set, int,           (size_t bytes))                           \
 X(alloc,           mangled(ref)*, (size_t size))                            \
+X(makeraw,         mangled(addr), (mangled(ref) *handle))                   \
 X(dump,            void,          (mangled(ref) *handle))
 
 #define X(id, ret, args)                                            \
