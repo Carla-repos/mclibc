@@ -13,9 +13,7 @@ __asm__(".text\n"
 
         "    movq %rsp, (%rdi)\n"
         "    movq %rsi, %rsp\n"
-
         "    movq %rdx, %r12\n"
-        "    movq %rcx, %r13\n"
 
         "    popq %r15\n"
         "    popq %r14\n"
@@ -25,8 +23,5 @@ __asm__(".text\n"
         "    popq %rbp\n"
 
         "    movq %r12, %rdi\n"
-        "    movq %r13, %rsi\n"
-
         "    ret\n");
-void __carla_routines_ctx_switch(void **save_sp, void *load_sp, void *manager,
-                                 void *current);
+void __carla_routines_ctx_switch(void **save_sp, void *load_sp, void *manager);
