@@ -4,9 +4,9 @@ echo did build nashj
 gcc -nostdlib -O0 -c -I./lib lib/development.c -o ./build/development.o
 echo did build development
 
-g++ -O0 -c -I./lib tests/main.cpp -o ./build/tests.o -lstdc++ -pthread
+gcc -O0 -c -I./lib tests/main.c -o ./build/tests.o
 
-g++ -fsanitize=address ./build/nashj.o ./build/development.o ./build/tests.o -o ./build/final
+gcc -fsanitize=address ./build/nashj.o ./build/development.o ./build/tests.o -o ./build/final
 
 echo "press some key to run the file"
 read
